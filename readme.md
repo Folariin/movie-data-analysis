@@ -171,54 +171,114 @@ ORDER BY average_rating DESC;
 ├── People.csv
 ├── Characters.csv
 ├── production_companies.csv
-├── auth.cfg.example
+├── auth.cfg.example          # copy to auth.cfg (git-ignored)
+├── setup/
+│   ├── configure-sqlexpress.ps1   # enables TCP 1433 + SQL logins on SQL Server Express
+│   └── create-database.sql        # creates moviedb and the movieapp login
 ├── .gitignore
 ├── mssql-jdbc-11.2.0.jre11.jar
 ├── makefile
-└── README.md
+└── readme.md
 ```
 
 `GroupInterface.java` contains the console interface, JDBC connection logic, schema creation, CSV import routines, result formatting, and report queries.
 
 ## How to Run the Program
 
-### 1. Set up SQL Server
+### Prerequisites
 
-Any SQL Server instance works (for example, the free SQL Server Express). The server must:
+- **Java JDK 17 or newer** (`java -version` and `javac -version` should both work)
+- **Microsoft SQL Server**: the free SQL Server 2022 Express edition is enough; its 10 GB limit is far more than this dataset needs
+- **sqlcmd**, the SQL Server command-line tool, to create the database
+- **GNU make** (optional; you can run `javac`/`java` directly instead, see step 5)
 
-- accept TCP connections (Express ships with TCP turned off; enable it and set port 1433 in SQL Server Configuration Manager)
-- allow SQL Server authentication ("mixed mode")
-- have a dedicated database plus a login that owns it:
+The JDBC driver (`mssql-jdbc-11.2.0.jre11.jar`) is already in the repository.
 
-```sql
-CREATE DATABASE moviedb;
-CREATE LOGIN movieapp WITH PASSWORD = '<strong password>';
-USE moviedb;
-CREATE USER movieapp FOR LOGIN movieapp;
-ALTER ROLE db_owner ADD MEMBER movieapp;
+### 1. Install SQL Server Express
+
+**Windows** (from PowerShell or Command Prompt; approve the administrator prompt):
+
+```powershell
+winget install --id Microsoft.SQLServer.2022.Express --silent --accept-package-agreements
+winget install --id Microsoft.Sqlcmd
 ```
 
-### 2. Configure the connection
+Or download the installer from Microsoft's [SQL Server downloads](https://www.microsoft.com/sql-server/sql-server-downloads) page, choose **Express**, then **Basic** installation.
+
+> **If setup fails** with an error about *Microsoft ODBC Driver 17 for SQL Server* (error 1706), a newer copy of that driver is already installed and blocks setup. Uninstall "Microsoft ODBC Driver 17 for SQL Server" in *Settings > Apps*, run the SQL Server install again, and then reinstall the latest driver with `winget install Microsoft.msodbcsql.17`.
+
+**macOS / Linux** (Docker), instead of steps 1 and 2:
 
 ```bash
-cp auth.cfg.example auth.cfg
+docker run -d --name moviedb-sql -p 1433:1433 \
+  -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='<strong sa password>' \
+  mcr.microsoft.com/mssql/server:2022-latest
 ```
 
-Edit `auth.cfg` with your `server`, `port`, `database`, `username` and `password`. The file is git-ignored.
+The container already accepts TCP connections on port 1433 and SQL Server logins.
 
-### 3. Run the application
+### 2. Allow the app to connect (Windows)
+
+SQL Server Express installs with TCP connections and SQL Server logins turned off, so the app cannot connect yet. From an **Administrator** PowerShell in the repository folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup\configure-sqlexpress.ps1
+```
+
+The script turns on TCP port 1433 and SQL Server authentication, then restarts SQL Server. (To do it by hand instead: in *SQL Server Configuration Manager*, enable TCP/IP for SQLEXPRESS with TCP Port 1433; in *SSMS*, set *Server authentication* to "SQL Server and Windows Authentication mode"; restart the service.)
+
+### 3. Create the database and app login
+
+Pick a strong password for the app login and run:
+
+```bash
+# Windows, using your Windows administrator login
+sqlcmd -S tcp:localhost,1433 -E -C -i setup/create-database.sql -v AppPassword="<strong password>"
+
+# Docker, using the sa login
+sqlcmd -S tcp:localhost,1433 -U sa -P "<strong sa password>" -C -i setup/create-database.sql -v AppPassword="<strong password>"
+```
+
+This creates the `moviedb` database and a `movieapp` login that owns it.
+
+### 4. Configure the connection
+
+```bash
+cp auth.cfg.example auth.cfg      # Windows Command Prompt: copy auth.cfg.example auth.cfg
+```
+
+Set `password` in `auth.cfg` to the app password from step 3. The defaults (`localhost`, port `1433`, database `moviedb`, user `movieapp`) match the steps above. `auth.cfg` is git-ignored, so your password stays on your machine.
+
+### 5. Run the application
 
 ```bash
 make run
 ```
 
-Choose option `3` on first run to create the tables and import the CSV data.
+Without make:
+
+```bash
+javac GroupInterface.java
+java -Dfile.encoding=UTF-8 -cp ".;mssql-jdbc-11.2.0.jre11.jar" GroupInterface   # Windows
+java -Dfile.encoding=UTF-8 -cp ".:mssql-jdbc-11.2.0.jre11.jar" GroupInterface   # macOS / Linux
+```
+
+On first run choose option **3** to create the tables and import the CSV data (about 2–4 minutes). Then choose option **1** to run reports.
 
 ### Clean compiled files
 
 ```bash
 make clean
 ```
+
+### Troubleshooting
+
+| Message | Fix |
+| --- | --- |
+| `Could not connect ... The TCP/IP connection to the host localhost, port 1433 has failed` | SQL Server isn't running or TCP is off; redo step 2, or start the `SQL Server (SQLEXPRESS)` service |
+| `Login failed for user 'movieapp'` | Password in `auth.cfg` doesn't match step 3, or SQL Server authentication is off (step 2) |
+| `Cannot open database "moviedb"` | Run step 3 |
+| `Could not find config file.` | Create `auth.cfg` (step 4) in the folder you run the app from |
 
 ## Project Status
 
@@ -229,10 +289,10 @@ The original university-hosted SQL Server is no longer available. The connection
 ## Limitations
 
 - The project uses SQL Server-specific syntax.
-- People are matched by name, which may not always be unique.
+- Movies.csv and Characters.csv credit people by name only, and about 2,350 names belong to more than one person. The importer picks the person who was alive around the movie's release (born before it, not dead more than five years before it), preferring the one who fits most of that name's credits, so near-duplicate records of one person collapse onto a single record.
+- The source data contains implausible dates: many people in `People.csv` have birth or death dates that conflict with their credits (for example, credited in films released years after their recorded death), and some movies have wrong release dates. These are kept as-is because the repository has no reference data to correct them.
 - `Characters.csv` and `production_companies.csv` identify movies only by title. When several movies share a title, the importer picks the one whose cast overlaps the listed actors; the other same-titled movies get no character or budget data, because the source files contain none for them.
 - The importer uses custom CSV parsing.
-- Reports have not been comprehensively revalidated against a current database.
 - The application is a console program without a web or API layer.
 
 ## Skills Demonstrated
