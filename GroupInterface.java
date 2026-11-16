@@ -20,6 +20,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.SimpleDateFormat;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -248,8 +249,11 @@ public class GroupInterface {
                 }
             } else if (option == 3) {
                 option = -1;
-                db.populate();
-                System.out.println(GREEN + "Successfully Populated the Database!" + RESET);
+                if (db.populate()) {
+                    System.out.println(GREEN + "Successfully Populated the Database!" + RESET);
+                } else {
+                    System.out.println(RED + "Populating the database failed; see the error above." + RESET);
+                }
                 /* Repopulate Databse data */
             }
         }
@@ -338,8 +342,32 @@ class MyDatabase {
     private Connection connection = null;
     private Statement statement = null;
 
-    private Map<String, Integer> personCache = new HashMap<>();
+    // A row of People.csv. Several people can share a name (e.g. Harrison Ford b.1884 and b.1942).
+    private static class PersonRecord {
+        final int id;
+        final LocalDate birth;
+        final LocalDate death; // null if alive
+
+        PersonRecord(int id, LocalDate birth, LocalDate death) {
+            this.id = id;
+            this.birth = birth;
+            this.death = death;
+        }
+    }
+
+    // Credited people who died more than this many years before a release are treated as unlikely
+    private static final int POSTHUMOUS_YEARS = 5;
+
+    private Map<String, List<PersonRecord>> peopleByName = new HashMap<>();
+    // person_id -> number of credits that person could plausibly hold (used to break ties)
+    private Map<Integer, Integer> personCreditPrior = new HashMap<>();
+    private Map<Integer, LocalDate> airDateByImdbId = new HashMap<>();
+    // Movie title -> the single imdb_id that Characters.csv / production_companies.csv rows refer to
     private Map<String, Integer> imdbIdMap = new HashMap<>();
+    // Movie title -> every imdb_id with that title in Movies.csv (some titles are shared by different films)
+    private Map<String, List<Integer>> titleToImdbIds = new HashMap<>();
+    // imdb_id -> cast names from Movies.csv, used to tell same-titled movies apart
+    private Map<Integer, Set<String>> castByImdbId = new HashMap<>();
     private final String GREEN = "\u001B[32m";
     private final String RESET = "\033[0m";
     private final String BLUE = "\u001B[34m";
@@ -369,39 +397,55 @@ class MyDatabase {
             System.out.println("Error reading config file.");
             System.exit(1);
         }
-        String username = (prop.getProperty("username"));
-        String password = (prop.getProperty("password"));
+        String username = prop.getProperty("username");
+        String password = prop.getProperty("password");
 
         if (username == null || password == null) {
             System.out.println("Username or password not provided.");
             System.exit(1);
         }
 
-        String connectionUrl = "jdbc:sqlserver://uranium.cs.umanitoba.ca:1433;"
-                + "database=cs3380;"
-                + "user=" + username + ";"
-                + "password=" + password + ";"
-                + "encrypt=false;"
-                + "trustServerCertificate=false;"
+        String server = prop.getProperty("server", "localhost").trim();
+        String port = prop.getProperty("port", "1433").trim();
+        String database = prop.getProperty("database", "moviedb").trim();
+        String encrypt = prop.getProperty("encrypt", "false").trim();
+        String trustServerCertificate = prop.getProperty("trustServerCertificate", "true").trim();
+
+        // Credentials go through Properties so special characters (e.g. ';') don't break the URL.
+        String connectionUrl = "jdbc:sqlserver://" + server + ":" + port + ";"
+                + "databaseName=" + database + ";"
+                + "encrypt=" + encrypt + ";"
+                + "trustServerCertificate=" + trustServerCertificate + ";"
                 + "loginTimeout=30;";
+        Properties connProps = new Properties();
+        connProps.setProperty("user", username.trim());
+        connProps.setProperty("password", password);
 
         try {
-            connection = DriverManager.getConnection(connectionUrl);
+            connection = DriverManager.getConnection(connectionUrl, connProps);
             statement = connection.createStatement();
 
-            System.out.println(GREEN + "CONNECTION SUCCESSFUL" + RESET);
+            System.out.println(GREEN + "CONNECTION SUCCESSFUL" + RESET + " (" + server + ":" + port + "/" + database + ")");
 
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
-            try {
-                connection.rollback();
-            } catch (SQLException e2) {
-                e2.printStackTrace();
-            }
+            System.out.println(RED + "Could not connect to " + server + ":" + port + "/" + database + RESET);
+            System.out.println("Reason: " + e.getMessage());
+            System.out.println("Check the server/port/database/username/password values in auth.cfg.");
+            System.exit(1);
         }
     }
 
-    public void populate() {
+    private void reportError(Exception e) {
+        System.out.println(RED + "Database error: " + e.getMessage() + RESET);
+    }
+
+    public boolean populate() {
+        peopleByName.clear();
+        personCreditPrior.clear();
+        airDateByImdbId.clear();
+        imdbIdMap.clear();
+        titleToImdbIds.clear();
+        castByImdbId.clear();
 
         try {
 
@@ -442,7 +486,7 @@ class MyDatabase {
             // Uploading Movie info
             startTime = System.currentTimeMillis();
             connection.setAutoCommit(false); // Begin transaction
-            loadPersonCache(); // Preload person IDs
+            loadPeople(); // Preload people for name matching
             readInMovieData();
             connection.commit(); // Commit transaction
             connection.setAutoCommit(true);// reset
@@ -454,7 +498,6 @@ class MyDatabase {
             // Uploading Characters info
             startTime = System.currentTimeMillis();
             connection.setAutoCommit(false); // Begin transaction
-            preloadImdbIDs(imdbIdMap);
             readCharacterData();
             connection.commit(); // Commit transaction
             connection.setAutoCommit(true);// reset
@@ -475,17 +518,20 @@ class MyDatabase {
                     RESET);
             System.out.println("Production Companies execution took: " + duration + " milliseconds");
 
-        } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            return true;
+        } catch (Exception e) {
+            reportError(e);
             try {
                 connection.rollback();
+                connection.setAutoCommit(true);
             } catch (SQLException e2) {
-                e2.printStackTrace();
+                reportError(e2);
             }
+            return false;
         }
     }
 
-    private void readPeopleFast() {
+    private void readPeopleFast() throws Exception {
         String csvFilePath = "People.csv";
         int batchSize = 2000;
 
@@ -532,21 +578,75 @@ class MyDatabase {
             // System.out.println(countLine + " People lines were read and inserted.");
             personStmt.close();
         } catch (Exception e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            throw new Exception("People.csv: " + e.getMessage(), e);
         }
     }
 
-    private void loadPersonCache() throws SQLException {
-        String query = "SELECT person_id, name FROM People";
+    private void loadPeople() throws SQLException {
+        String query = "SELECT person_id, name, birthdate, deathdate FROM People";
         try (Statement stmt = connection.createStatement();
                 ResultSet rs = stmt.executeQuery(query)) {
             while (rs.next()) {
-                personCache.put(rs.getString("name").trim(), rs.getInt("person_id"));
+                Date death = rs.getDate("deathdate");
+                PersonRecord person = new PersonRecord(rs.getInt("person_id"),
+                        rs.getDate("birthdate").toLocalDate(),
+                        death == null ? null : death.toLocalDate());
+                peopleByName.computeIfAbsent(rs.getString("name").trim(), k -> new ArrayList<>()).add(person);
             }
         }
     }
 
-    private void readInMovieData() {
+    // Plausible = born on or before the release and not dead long before it
+    private static boolean plausibleFor(PersonRecord p, LocalDate release) {
+        return !p.birth.isAfter(release)
+                && (p.death == null || !p.death.isBefore(release.minusYears(POSTHUMOUS_YEARS)));
+    }
+
+    /*
+     * Movies.csv and Characters.csv credit people by name only. When a name belongs to several
+     * people, keep those who were alive around the release (born before it, not dead more than
+     * POSTHUMOUS_YEARS before it), then prefer the one who fits the most of that name's credits
+     * across the dataset (personCreditPrior), then the lowest person_id so the choice is stable.
+     * Near-duplicate records of the same person therefore all collapse onto one person_id.
+     */
+    private Integer resolvePerson(String name, LocalDate release) {
+        List<PersonRecord> candidates = peopleByName.get(name);
+        if (candidates == null) {
+            return null;
+        }
+        if (candidates.size() == 1 || release == null) {
+            return pickByPrior(candidates);
+        }
+        List<PersonRecord> pool = new ArrayList<>();
+        for (PersonRecord p : candidates) {
+            if (plausibleFor(p, release)) {
+                pool.add(p);
+            }
+        }
+        if (pool.isEmpty()) { // fall back to anyone born before the release, then to everyone
+            for (PersonRecord p : candidates) {
+                if (!p.birth.isAfter(release)) {
+                    pool.add(p);
+                }
+            }
+        }
+        return pickByPrior(pool.isEmpty() ? candidates : pool);
+    }
+
+    private Integer pickByPrior(List<PersonRecord> pool) {
+        PersonRecord best = null;
+        int bestPrior = -1;
+        for (PersonRecord p : pool) {
+            int prior = personCreditPrior.getOrDefault(p.id, 0);
+            if (prior > bestPrior || (prior == bestPrior && p.id < best.id)) {
+                best = p;
+                bestPrior = prior;
+            }
+        }
+        return best.id;
+    }
+
+    private void readInMovieData() throws Exception {
         String csvFilePath = "Movies.csv";
         int batchSize = 2000;
 
@@ -565,18 +665,37 @@ class MyDatabase {
             PreparedStatement workedInStmt = connection.prepareStatement(
                     "INSERT INTO workedIn (imdb_id, person_id, role) VALUES (?, ?, ?)");
 
-            int countLine = 0;
             int batchCount = 0;
 
+            List<String[]> movieRows = new ArrayList<>();
             while ((line = br.readLine()) != null) {
-                countLine++;
                 String[] columns = line.split(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
 
                 // Trim and remove quotes
                 for (int i = 0; i < columns.length; i++) {
                     columns[i] = columns[i].replaceAll("^\"|\"$", "").trim();
                 }
+                movieRows.add(columns);
+            }
 
+            // First pass: for shared names, count how many credits each person could plausibly hold
+            for (String[] columns : movieRows) {
+                LocalDate release = LocalDate.parse(columns[11]);
+                for (int i = 7; i <= 10; i++) {
+                    for (String name : columns[i].split(",")) {
+                        List<PersonRecord> candidates = peopleByName.get(name.trim());
+                        if (candidates == null || candidates.size() < 2)
+                            continue;
+                        for (PersonRecord p : candidates) {
+                            if (plausibleFor(p, release)) {
+                                personCreditPrior.merge(p.id, 1, Integer::sum);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (String[] columns : movieRows) {
                 // Insert into Movie
                 movieStmt.setInt(1, Integer.parseInt(columns[3])); // imdb_id
                 movieStmt.setString(2, columns[0]); // title
@@ -584,6 +703,17 @@ class MyDatabase {
                 movieStmt.setInt(4, Integer.parseInt(columns[2])); // runtime
                 movieStmt.setDouble(5, Double.parseDouble(columns[1])); // rating
                 movieStmt.addBatch();
+
+                // Remember title and cast so later files (which only name the title) can be matched
+                int movieId = Integer.parseInt(columns[3]);
+                titleToImdbIds.computeIfAbsent(columns[0], k -> new ArrayList<>()).add(movieId);
+                Set<String> cast = new HashSet<>();
+                for (String name : columns[10].split(",")) {
+                    cast.add(name.trim());
+                }
+                castByImdbId.put(movieId, cast);
+                LocalDate release = LocalDate.parse(columns[11]);
+                airDateByImdbId.put(movieId, release);
 
                 // Insert into MovieLanguages
                 for (String lang : columns[4].split(",")) {
@@ -616,8 +746,8 @@ class MyDatabase {
                         default -> null;
                     };
                     for (String name : columns[i].split(",")) {
-                        int personId = personCache.getOrDefault(name.trim(), -1);
-                        if (personId != -1) {
+                        Integer personId = resolvePerson(name.trim(), release);
+                        if (personId != null) {
                             workedInStmt.setInt(1, Integer.parseInt(columns[3]));
                             workedInStmt.setInt(2, personId);
                             workedInStmt.setString(3, role);
@@ -643,7 +773,6 @@ class MyDatabase {
             genreStmt.executeBatch();
             workedInStmt.executeBatch();
 
-            // System.out.println(countLine + " Movie lines were read and inserted.");
             movieStmt.close();
             langStmt.close();
             countryStmt.close();
@@ -651,18 +780,15 @@ class MyDatabase {
             workedInStmt.close();
 
         } catch (Exception e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            throw new Exception("Movies.csv: " + e.getMessage(), e);
         }
     }
 
-    private void readCharacterData() {
+    private void readCharacterData() throws Exception {
         String csvFilePath = "Characters.csv";
         Map<String, Integer> characterIdMap = new HashMap<>();
-        Map<String, Integer> personIdMap = new HashMap<>();
         AtomicInteger idCounter = new AtomicInteger(1);
         int batchSize = 3000;
-
-        preloadPersonIDs(personIdMap);
 
         try (BufferedReader br = new BufferedReader(
                 new InputStreamReader(new FileInputStream(csvFilePath), StandardCharsets.UTF_8))) {
@@ -679,6 +805,18 @@ class MyDatabase {
                 String characterName = columns[1].trim().replaceAll("^\"|\"$", "");
                 uniqueCharacters.add(characterName);
             }
+
+            // Collect the actors listed per title, then resolve each title to one imdb_id
+            Map<String, Set<String>> actorsByTitle = new HashMap<>();
+            for (String[] columns : rows) {
+                String movieTitle = columns[2].trim().replaceAll("^\"|\"$", "");
+                List<Integer> ids = titleToImdbIds.get(movieTitle);
+                if (ids != null && ids.size() > 1) {
+                    actorsByTitle.computeIfAbsent(movieTitle, k -> new HashSet<>())
+                            .add(columns[0].trim().replaceAll("^\"|\"$", ""));
+                }
+            }
+            resolveMovieTitles(actorsByTitle);
 
             // Assign IDs to unique characters
             for (String characterName : uniqueCharacters) {
@@ -706,6 +844,8 @@ class MyDatabase {
                     PreparedStatement isInStmt = connection.prepareStatement(
                             "INSERT INTO isIn (character_id, imdb_id) VALUES (?, ?);")) {
                 int batchCount = 0;
+                Set<String> seenPlayedBy = new HashSet<>();
+                Set<String> seenIsIn = new HashSet<>();
 
                 for (String[] columns : rows) {
                     String characterName = columns[1].trim().replaceAll("^\"|\"$", "");
@@ -713,25 +853,27 @@ class MyDatabase {
                     String personName = columns[0].trim().replaceAll("^\"|\"$", "");
 
                     Integer characterId = characterIdMap.get(characterName);
-                    // Integer personId = personIdMap.getOrDefault(personName, -1);
-                    Integer personId = personIdMap.get(personName);
-                    // Integer imdbId = imdbIdMap.getOrDefault(movieTitle, -1);
                     Integer imdbId = imdbIdMap.get(movieTitle);
-                    // System.out.println(personId + "-" + columns[0] + " : " + columns[1] + "-" +
-                    // characterId);
+                    if (imdbId == null)
+                        continue;
+                    Integer personId = resolvePerson(personName, airDateByImdbId.get(imdbId));
+                    if (personId == null)
+                        continue;
 
-                    // if (personId == -1 || imdbId == -1)
-                    if (personId == null || imdbId == null)
-                        continue; // Log skipped rows for debugging
+                    // Characters.csv repeats some movies' blocks; insert each relationship once
+                    if (!seenPlayedBy.add(characterId + ":" + personId + ":" + imdbId))
+                        continue;
 
                     playedByStmt.setInt(1, characterId);
                     playedByStmt.setInt(2, personId);
                     playedByStmt.setInt(3, imdbId);
                     playedByStmt.addBatch();
 
-                    isInStmt.setInt(1, characterId);
-                    isInStmt.setInt(2, imdbId);
-                    isInStmt.addBatch();
+                    if (seenIsIn.add(characterId + ":" + imdbId)) {
+                        isInStmt.setInt(1, characterId);
+                        isInStmt.setInt(2, imdbId);
+                        isInStmt.addBatch();
+                    }
 
                     if (++batchCount % batchSize == 0) {
                         playedByStmt.executeBatch();
@@ -746,16 +888,11 @@ class MyDatabase {
             connection.commit(); // Commit all changes
             connection.setAutoCommit(true);// reset
         } catch (Exception e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
-            try {
-                connection.rollback(); // Rollback if any error occurs
-            } catch (SQLException ex) {
-                ex.printStackTrace();
-            }
+            throw new Exception("Characters.csv: " + e.getMessage(), e);
         }
     }
 
-    private void readProdCompany() {
+    private void readProdCompany() throws Exception {
         String csvFilePath = "production_companies.csv";
         Map<String, Integer> companiesMap = new HashMap<>(); // Map to store company name -> ID
         AtomicInteger idCounter = new AtomicInteger(1); // Auto-increment ID for companies
@@ -813,6 +950,7 @@ class MyDatabase {
             try (PreparedStatement financeStmt = connection.prepareStatement(
                     "INSERT INTO Finances (company_id, imdb_id, budget) VALUES (?, ?, ?)")) {
                 int batchCount = 0;
+                Set<String> seenFinances = new HashSet<>();
                 for (String[] columns : rows) {
                     String movieTitle = columns[0].trim().replaceAll("^\"|\"$", "");
                     double budget = Double.parseDouble(columns[2].trim().replaceAll("^\"|\"$", ""));
@@ -831,6 +969,11 @@ class MyDatabase {
 
                             if (companyId == null) {
                                 System.err.println("Company not found in map: " + company);
+                                continue;
+                            }
+                            // Same-titled movies share identical rows in this file; insert once
+                            if (!seenFinances.add(imdbId + ":" + companyId)) {
+                                continue;
                             }
 
                             financeStmt.setInt(1, companyId);
@@ -852,37 +995,55 @@ class MyDatabase {
             connection.setAutoCommit(true);// reset
 
         } catch (Exception e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
-            try {
-                connection.rollback(); // Rollback on error
-            } catch (SQLException rollbackEx) {
-                rollbackEx.printStackTrace();
-            }
+            throw new Exception("production_companies.csv: " + e.getMessage(), e);
         }
     }
 
-    // Preload IDs for optimization
-    private void preloadPersonIDs(Map<String, Integer> personIdMap) {
-        try (PreparedStatement pstmt = connection.prepareStatement("SELECT person_id, name FROM People")) {
-            ResultSet rs = pstmt.executeQuery();
-            while (rs.next()) {
-                String name = rs.getString("name");
-                int id = rs.getInt("person_id");
-                personIdMap.put(name, id);
+    /*
+     * Characters.csv and production_companies.csv identify movies only by title, and a few
+     * titles belong to more than one movie (e.g. "Black Widow" 2019 and 2021). For those, pick
+     * the movie whose Movies.csv cast overlaps most with the actors Characters.csv lists for that
+     * title. Titles that cannot be resolved are left out so their rows are skipped rather than
+     * attached to the wrong movie.
+     */
+    private void resolveMovieTitles(Map<String, Set<String>> actorsByTitle) {
+        imdbIdMap.clear();
+        for (Map.Entry<String, List<Integer>> entry : titleToImdbIds.entrySet()) {
+            String title = entry.getKey();
+            List<Integer> ids = entry.getValue();
+            if (ids.size() == 1) {
+                imdbIdMap.put(title, ids.get(0));
+                continue;
             }
-        } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
-        }
-    }
 
-    private void preloadImdbIDs(Map<String, Integer> imdbIdMap) {
-        try (PreparedStatement pstmt = connection.prepareStatement("SELECT imdb_id, title FROM Movie")) {
-            ResultSet rs = pstmt.executeQuery();
-            while (rs.next()) {
-                imdbIdMap.put(rs.getString("title"), rs.getInt("imdb_id"));
+            Set<String> actors = actorsByTitle.getOrDefault(title, new HashSet<>());
+            Integer best = null;
+            int bestOverlap = 0;
+            boolean tie = false;
+            for (Integer id : ids) {
+                int overlap = 0;
+                for (String actor : actors) {
+                    if (castByImdbId.getOrDefault(id, new HashSet<>()).contains(actor)) {
+                        overlap++;
+                    }
+                }
+                if (overlap > bestOverlap) {
+                    best = id;
+                    bestOverlap = overlap;
+                    tie = false;
+                } else if (overlap == bestOverlap && overlap > 0) {
+                    tie = true;
+                }
             }
-        } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+
+            if (best != null && !tie) {
+                imdbIdMap.put(title, best);
+                System.out.println("Title \"" + title + "\" matches " + ids.size()
+                        + " movies; using imdb_id " + best + " (" + bestOverlap + " cast matches)");
+            } else {
+                System.err.println("Title \"" + title + "\" matches " + ids
+                        + " and cannot be told apart; skipping its character and budget rows");
+            }
         }
     }
 
@@ -913,7 +1074,7 @@ class MyDatabase {
             resultSet.close();
             statement.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -941,7 +1102,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -969,7 +1130,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1000,7 +1161,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1028,7 +1189,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1056,7 +1217,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1083,7 +1244,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1114,7 +1275,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1225,7 +1386,7 @@ class MyDatabase {
                         }
                     }
                 } catch (SQLException e) {
-                    System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+                    reportError(e);
                 }
             }
         }
@@ -1237,7 +1398,7 @@ class MyDatabase {
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.executeUpdate();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1276,7 +1437,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
 
     }
@@ -1304,7 +1465,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1332,7 +1493,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1357,7 +1518,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1383,7 +1544,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1409,7 +1570,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1436,7 +1597,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1463,7 +1624,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1489,7 +1650,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 

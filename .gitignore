@@ -1,0 +1,5 @@
+# Local credentials
+auth.cfg
+
+# Build output
+*.class
