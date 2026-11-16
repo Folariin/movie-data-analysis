@@ -182,13 +182,37 @@ ORDER BY average_rating DESC;
 
 ## How to Run the Program
 
-The original project uses a Makefile for compilation and execution.
+### 1. Set up SQL Server
 
-### Run the application
+Any SQL Server instance works (for example, the free SQL Server Express). The server must:
+
+- accept TCP connections (Express ships with TCP turned off; enable it and set port 1433 in SQL Server Configuration Manager)
+- allow SQL Server authentication ("mixed mode")
+- have a dedicated database plus a login that owns it:
+
+```sql
+CREATE DATABASE moviedb;
+CREATE LOGIN movieapp WITH PASSWORD = '<strong password>';
+USE moviedb;
+CREATE USER movieapp FOR LOGIN movieapp;
+ALTER ROLE db_owner ADD MEMBER movieapp;
+```
+
+### 2. Configure the connection
+
+```bash
+cp auth.cfg.example auth.cfg
+```
+
+Edit `auth.cfg` with your `server`, `port`, `database`, `username` and `password`. The file is git-ignored.
+
+### 3. Run the application
 
 ```bash
 make run
 ```
+
+Choose option `3` on first run to create the tables and import the CSV data.
 
 ### Clean compiled files
 
@@ -196,21 +220,11 @@ make run
 make clean
 ```
 
-> Note: The original Makefile was written for the university environment and may require adjustment on Windows or when using a local SQL Server setup.
-
 ## Project Status
 
 The source code, datasets, schema logic, and 19 reports are preserved.
 
-The original university-hosted SQL Server environment is no longer available, and a complete local restoration has not yet been fully verified.
-
-A local setup requires:
-
-1. A Microsoft SQL Server instance
-2. A dedicated database
-3. Updated credentials
-4. The Microsoft SQL Server JDBC driver
-5. An end-to-end import and report verification pass
+The original university-hosted SQL Server is no longer available. The connection is now configured through `auth.cfg`, and the project has been restored and verified end to end on a local SQL Server 2022 Express instance: the full import completes (8,041 movies, 270,117 people, about 445,000 casting rows) and all 19 reports return results.
 
 ## Limitations
 

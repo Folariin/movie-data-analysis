@@ -248,8 +248,11 @@ public class GroupInterface {
                 }
             } else if (option == 3) {
                 option = -1;
-                db.populate();
-                System.out.println(GREEN + "Successfully Populated the Database!" + RESET);
+                if (db.populate()) {
+                    System.out.println(GREEN + "Successfully Populated the Database!" + RESET);
+                } else {
+                    System.out.println(RED + "Populating the database failed; see the error above." + RESET);
+                }
                 /* Repopulate Databse data */
             }
         }
@@ -369,39 +372,51 @@ class MyDatabase {
             System.out.println("Error reading config file.");
             System.exit(1);
         }
-        String username = (prop.getProperty("username"));
-        String password = (prop.getProperty("password"));
+        String username = prop.getProperty("username");
+        String password = prop.getProperty("password");
 
         if (username == null || password == null) {
             System.out.println("Username or password not provided.");
             System.exit(1);
         }
 
-        String connectionUrl = "jdbc:sqlserver://uranium.cs.umanitoba.ca:1433;"
-                + "database=cs3380;"
-                + "user=" + username + ";"
-                + "password=" + password + ";"
-                + "encrypt=false;"
-                + "trustServerCertificate=false;"
+        String server = prop.getProperty("server", "localhost").trim();
+        String port = prop.getProperty("port", "1433").trim();
+        String database = prop.getProperty("database", "moviedb").trim();
+        String encrypt = prop.getProperty("encrypt", "false").trim();
+        String trustServerCertificate = prop.getProperty("trustServerCertificate", "true").trim();
+
+        // Credentials go through Properties so special characters (e.g. ';') don't break the URL.
+        String connectionUrl = "jdbc:sqlserver://" + server + ":" + port + ";"
+                + "databaseName=" + database + ";"
+                + "encrypt=" + encrypt + ";"
+                + "trustServerCertificate=" + trustServerCertificate + ";"
                 + "loginTimeout=30;";
+        Properties connProps = new Properties();
+        connProps.setProperty("user", username.trim());
+        connProps.setProperty("password", password);
 
         try {
-            connection = DriverManager.getConnection(connectionUrl);
+            connection = DriverManager.getConnection(connectionUrl, connProps);
             statement = connection.createStatement();
 
-            System.out.println(GREEN + "CONNECTION SUCCESSFUL" + RESET);
+            System.out.println(GREEN + "CONNECTION SUCCESSFUL" + RESET + " (" + server + ":" + port + "/" + database + ")");
 
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
-            try {
-                connection.rollback();
-            } catch (SQLException e2) {
-                e2.printStackTrace();
-            }
+            System.out.println(RED + "Could not connect to " + server + ":" + port + "/" + database + RESET);
+            System.out.println("Reason: " + e.getMessage());
+            System.out.println("Check the server/port/database/username/password values in auth.cfg.");
+            System.exit(1);
         }
     }
 
-    public void populate() {
+    private void reportError(Exception e) {
+        System.out.println(RED + "Database error: " + e.getMessage() + RESET);
+    }
+
+    public boolean populate() {
+        personCache.clear();
+        imdbIdMap.clear();
 
         try {
 
@@ -475,17 +490,20 @@ class MyDatabase {
                     RESET);
             System.out.println("Production Companies execution took: " + duration + " milliseconds");
 
-        } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            return true;
+        } catch (Exception e) {
+            reportError(e);
             try {
                 connection.rollback();
+                connection.setAutoCommit(true);
             } catch (SQLException e2) {
-                e2.printStackTrace();
+                reportError(e2);
             }
+            return false;
         }
     }
 
-    private void readPeopleFast() {
+    private void readPeopleFast() throws Exception {
         String csvFilePath = "People.csv";
         int batchSize = 2000;
 
@@ -532,7 +550,7 @@ class MyDatabase {
             // System.out.println(countLine + " People lines were read and inserted.");
             personStmt.close();
         } catch (Exception e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            throw new Exception("People.csv: " + e.getMessage(), e);
         }
     }
 
@@ -546,7 +564,7 @@ class MyDatabase {
         }
     }
 
-    private void readInMovieData() {
+    private void readInMovieData() throws Exception {
         String csvFilePath = "Movies.csv";
         int batchSize = 2000;
 
@@ -651,11 +669,11 @@ class MyDatabase {
             workedInStmt.close();
 
         } catch (Exception e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            throw new Exception("Movies.csv: " + e.getMessage(), e);
         }
     }
 
-    private void readCharacterData() {
+    private void readCharacterData() throws Exception {
         String csvFilePath = "Characters.csv";
         Map<String, Integer> characterIdMap = new HashMap<>();
         Map<String, Integer> personIdMap = new HashMap<>();
@@ -746,16 +764,11 @@ class MyDatabase {
             connection.commit(); // Commit all changes
             connection.setAutoCommit(true);// reset
         } catch (Exception e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
-            try {
-                connection.rollback(); // Rollback if any error occurs
-            } catch (SQLException ex) {
-                ex.printStackTrace();
-            }
+            throw new Exception("Characters.csv: " + e.getMessage(), e);
         }
     }
 
-    private void readProdCompany() {
+    private void readProdCompany() throws Exception {
         String csvFilePath = "production_companies.csv";
         Map<String, Integer> companiesMap = new HashMap<>(); // Map to store company name -> ID
         AtomicInteger idCounter = new AtomicInteger(1); // Auto-increment ID for companies
@@ -831,6 +844,7 @@ class MyDatabase {
 
                             if (companyId == null) {
                                 System.err.println("Company not found in map: " + company);
+                                continue;
                             }
 
                             financeStmt.setInt(1, companyId);
@@ -852,17 +866,12 @@ class MyDatabase {
             connection.setAutoCommit(true);// reset
 
         } catch (Exception e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
-            try {
-                connection.rollback(); // Rollback on error
-            } catch (SQLException rollbackEx) {
-                rollbackEx.printStackTrace();
-            }
+            throw new Exception("production_companies.csv: " + e.getMessage(), e);
         }
     }
 
     // Preload IDs for optimization
-    private void preloadPersonIDs(Map<String, Integer> personIdMap) {
+    private void preloadPersonIDs(Map<String, Integer> personIdMap) throws SQLException {
         try (PreparedStatement pstmt = connection.prepareStatement("SELECT person_id, name FROM People")) {
             ResultSet rs = pstmt.executeQuery();
             while (rs.next()) {
@@ -870,19 +879,15 @@ class MyDatabase {
                 int id = rs.getInt("person_id");
                 personIdMap.put(name, id);
             }
-        } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
         }
     }
 
-    private void preloadImdbIDs(Map<String, Integer> imdbIdMap) {
+    private void preloadImdbIDs(Map<String, Integer> imdbIdMap) throws SQLException {
         try (PreparedStatement pstmt = connection.prepareStatement("SELECT imdb_id, title FROM Movie")) {
             ResultSet rs = pstmt.executeQuery();
             while (rs.next()) {
                 imdbIdMap.put(rs.getString("title"), rs.getInt("imdb_id"));
             }
-        } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
         }
     }
 
@@ -913,7 +918,7 @@ class MyDatabase {
             resultSet.close();
             statement.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -941,7 +946,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -969,7 +974,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1000,7 +1005,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1028,7 +1033,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1056,7 +1061,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1083,7 +1088,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1114,7 +1119,7 @@ class MyDatabase {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1225,7 +1230,7 @@ class MyDatabase {
                         }
                     }
                 } catch (SQLException e) {
-                    System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+                    reportError(e);
                 }
             }
         }
@@ -1237,7 +1242,7 @@ class MyDatabase {
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.executeUpdate();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1276,7 +1281,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
 
     }
@@ -1304,7 +1309,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1332,7 +1337,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1357,7 +1362,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1383,7 +1388,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1409,7 +1414,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1436,7 +1441,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1463,7 +1468,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 
@@ -1489,7 +1494,7 @@ class MyDatabase {
             }
             resultSet.close();
         } catch (SQLException e) {
-            System.out.println("Oops, An Error Occurred, Good Luck Injecting this program😊");
+            reportError(e);
         }
     }
 

@@ -1,0 +1,9 @@
+# Copy this file to auth.cfg and fill in your own values.
+# auth.cfg is git-ignored; never commit real credentials.
+server=localhost
+port=1433
+database=moviedb
+username=movieapp
+password=change-me
+encrypt=false
+trustServerCertificate=true
