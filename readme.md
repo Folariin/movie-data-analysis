@@ -229,7 +229,8 @@ The original university-hosted SQL Server is no longer available. The connection
 ## Limitations
 
 - The project uses SQL Server-specific syntax.
-- Some relationships are matched using names or movie titles, which may not always be unique.
+- People are matched by name, which may not always be unique.
+- `Characters.csv` and `production_companies.csv` identify movies only by title. When several movies share a title, the importer picks the one whose cast overlaps the listed actors; the other same-titled movies get no character or budget data, because the source files contain none for them.
 - The importer uses custom CSV parsing.
 - Reports have not been comprehensively revalidated against a current database.
 - The application is a console program without a web or API layer.

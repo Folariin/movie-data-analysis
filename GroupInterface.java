@@ -342,7 +342,12 @@ class MyDatabase {
     private Statement statement = null;
 
     private Map<String, Integer> personCache = new HashMap<>();
+    // Movie title -> the single imdb_id that Characters.csv / production_companies.csv rows refer to
     private Map<String, Integer> imdbIdMap = new HashMap<>();
+    // Movie title -> every imdb_id with that title in Movies.csv (some titles are shared by different films)
+    private Map<String, List<Integer>> titleToImdbIds = new HashMap<>();
+    // imdb_id -> cast names from Movies.csv, used to tell same-titled movies apart
+    private Map<Integer, Set<String>> castByImdbId = new HashMap<>();
     private final String GREEN = "\u001B[32m";
     private final String RESET = "\033[0m";
     private final String BLUE = "\u001B[34m";
@@ -417,6 +422,8 @@ class MyDatabase {
     public boolean populate() {
         personCache.clear();
         imdbIdMap.clear();
+        titleToImdbIds.clear();
+        castByImdbId.clear();
 
         try {
 
@@ -469,7 +476,6 @@ class MyDatabase {
             // Uploading Characters info
             startTime = System.currentTimeMillis();
             connection.setAutoCommit(false); // Begin transaction
-            preloadImdbIDs(imdbIdMap);
             readCharacterData();
             connection.commit(); // Commit transaction
             connection.setAutoCommit(true);// reset
@@ -603,6 +609,15 @@ class MyDatabase {
                 movieStmt.setDouble(5, Double.parseDouble(columns[1])); // rating
                 movieStmt.addBatch();
 
+                // Remember title and cast so later files (which only name the title) can be matched
+                int movieId = Integer.parseInt(columns[3]);
+                titleToImdbIds.computeIfAbsent(columns[0], k -> new ArrayList<>()).add(movieId);
+                Set<String> cast = new HashSet<>();
+                for (String name : columns[10].split(",")) {
+                    cast.add(name.trim());
+                }
+                castByImdbId.put(movieId, cast);
+
                 // Insert into MovieLanguages
                 for (String lang : columns[4].split(",")) {
                     langStmt.setInt(1, Integer.parseInt(columns[3]));
@@ -698,6 +713,18 @@ class MyDatabase {
                 uniqueCharacters.add(characterName);
             }
 
+            // Collect the actors listed per title, then resolve each title to one imdb_id
+            Map<String, Set<String>> actorsByTitle = new HashMap<>();
+            for (String[] columns : rows) {
+                String movieTitle = columns[2].trim().replaceAll("^\"|\"$", "");
+                List<Integer> ids = titleToImdbIds.get(movieTitle);
+                if (ids != null && ids.size() > 1) {
+                    actorsByTitle.computeIfAbsent(movieTitle, k -> new HashSet<>())
+                            .add(columns[0].trim().replaceAll("^\"|\"$", ""));
+                }
+            }
+            resolveMovieTitles(actorsByTitle);
+
             // Assign IDs to unique characters
             for (String characterName : uniqueCharacters) {
                 characterIdMap.put(characterName, idCounter.getAndIncrement());
@@ -724,6 +751,8 @@ class MyDatabase {
                     PreparedStatement isInStmt = connection.prepareStatement(
                             "INSERT INTO isIn (character_id, imdb_id) VALUES (?, ?);")) {
                 int batchCount = 0;
+                Set<String> seenPlayedBy = new HashSet<>();
+                Set<String> seenIsIn = new HashSet<>();
 
                 for (String[] columns : rows) {
                     String characterName = columns[1].trim().replaceAll("^\"|\"$", "");
@@ -742,14 +771,20 @@ class MyDatabase {
                     if (personId == null || imdbId == null)
                         continue; // Log skipped rows for debugging
 
+                    // Characters.csv repeats some movies' blocks; insert each relationship once
+                    if (!seenPlayedBy.add(characterId + ":" + personId + ":" + imdbId))
+                        continue;
+
                     playedByStmt.setInt(1, characterId);
                     playedByStmt.setInt(2, personId);
                     playedByStmt.setInt(3, imdbId);
                     playedByStmt.addBatch();
 
-                    isInStmt.setInt(1, characterId);
-                    isInStmt.setInt(2, imdbId);
-                    isInStmt.addBatch();
+                    if (seenIsIn.add(characterId + ":" + imdbId)) {
+                        isInStmt.setInt(1, characterId);
+                        isInStmt.setInt(2, imdbId);
+                        isInStmt.addBatch();
+                    }
 
                     if (++batchCount % batchSize == 0) {
                         playedByStmt.executeBatch();
@@ -826,6 +861,7 @@ class MyDatabase {
             try (PreparedStatement financeStmt = connection.prepareStatement(
                     "INSERT INTO Finances (company_id, imdb_id, budget) VALUES (?, ?, ?)")) {
                 int batchCount = 0;
+                Set<String> seenFinances = new HashSet<>();
                 for (String[] columns : rows) {
                     String movieTitle = columns[0].trim().replaceAll("^\"|\"$", "");
                     double budget = Double.parseDouble(columns[2].trim().replaceAll("^\"|\"$", ""));
@@ -844,6 +880,10 @@ class MyDatabase {
 
                             if (companyId == null) {
                                 System.err.println("Company not found in map: " + company);
+                                continue;
+                            }
+                            // Same-titled movies share identical rows in this file; insert once
+                            if (!seenFinances.add(imdbId + ":" + companyId)) {
                                 continue;
                             }
 
@@ -882,11 +922,50 @@ class MyDatabase {
         }
     }
 
-    private void preloadImdbIDs(Map<String, Integer> imdbIdMap) throws SQLException {
-        try (PreparedStatement pstmt = connection.prepareStatement("SELECT imdb_id, title FROM Movie")) {
-            ResultSet rs = pstmt.executeQuery();
-            while (rs.next()) {
-                imdbIdMap.put(rs.getString("title"), rs.getInt("imdb_id"));
+    /*
+     * Characters.csv and production_companies.csv identify movies only by title, and a few
+     * titles belong to more than one movie (e.g. "Black Widow" 2019 and 2021). For those, pick
+     * the movie whose Movies.csv cast overlaps most with the actors Characters.csv lists for that
+     * title. Titles that cannot be resolved are left out so their rows are skipped rather than
+     * attached to the wrong movie.
+     */
+    private void resolveMovieTitles(Map<String, Set<String>> actorsByTitle) {
+        imdbIdMap.clear();
+        for (Map.Entry<String, List<Integer>> entry : titleToImdbIds.entrySet()) {
+            String title = entry.getKey();
+            List<Integer> ids = entry.getValue();
+            if (ids.size() == 1) {
+                imdbIdMap.put(title, ids.get(0));
+                continue;
+            }
+
+            Set<String> actors = actorsByTitle.getOrDefault(title, new HashSet<>());
+            Integer best = null;
+            int bestOverlap = 0;
+            boolean tie = false;
+            for (Integer id : ids) {
+                int overlap = 0;
+                for (String actor : actors) {
+                    if (castByImdbId.getOrDefault(id, new HashSet<>()).contains(actor)) {
+                        overlap++;
+                    }
+                }
+                if (overlap > bestOverlap) {
+                    best = id;
+                    bestOverlap = overlap;
+                    tie = false;
+                } else if (overlap == bestOverlap && overlap > 0) {
+                    tie = true;
+                }
+            }
+
+            if (best != null && !tie) {
+                imdbIdMap.put(title, best);
+                System.out.println("Title \"" + title + "\" matches " + ids.size()
+                        + " movies; using imdb_id " + best + " (" + bestOverlap + " cast matches)");
+            } else {
+                System.err.println("Title \"" + title + "\" matches " + ids
+                        + " and cannot be told apart; skipping its character and budget rows");
             }
         }
     }
