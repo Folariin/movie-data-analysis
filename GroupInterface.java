@@ -20,6 +20,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.SimpleDateFormat;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -341,7 +342,26 @@ class MyDatabase {
     private Connection connection = null;
     private Statement statement = null;
 
-    private Map<String, Integer> personCache = new HashMap<>();
+    // A row of People.csv. Several people can share a name (e.g. Harrison Ford b.1884 and b.1942).
+    private static class PersonRecord {
+        final int id;
+        final LocalDate birth;
+        final LocalDate death; // null if alive
+
+        PersonRecord(int id, LocalDate birth, LocalDate death) {
+            this.id = id;
+            this.birth = birth;
+            this.death = death;
+        }
+    }
+
+    // Credited people who died more than this many years before a release are treated as unlikely
+    private static final int POSTHUMOUS_YEARS = 5;
+
+    private Map<String, List<PersonRecord>> peopleByName = new HashMap<>();
+    // person_id -> number of credits that person could plausibly hold (used to break ties)
+    private Map<Integer, Integer> personCreditPrior = new HashMap<>();
+    private Map<Integer, LocalDate> airDateByImdbId = new HashMap<>();
     // Movie title -> the single imdb_id that Characters.csv / production_companies.csv rows refer to
     private Map<String, Integer> imdbIdMap = new HashMap<>();
     // Movie title -> every imdb_id with that title in Movies.csv (some titles are shared by different films)
@@ -420,7 +440,9 @@ class MyDatabase {
     }
 
     public boolean populate() {
-        personCache.clear();
+        peopleByName.clear();
+        personCreditPrior.clear();
+        airDateByImdbId.clear();
         imdbIdMap.clear();
         titleToImdbIds.clear();
         castByImdbId.clear();
@@ -464,7 +486,7 @@ class MyDatabase {
             // Uploading Movie info
             startTime = System.currentTimeMillis();
             connection.setAutoCommit(false); // Begin transaction
-            loadPersonCache(); // Preload person IDs
+            loadPeople(); // Preload people for name matching
             readInMovieData();
             connection.commit(); // Commit transaction
             connection.setAutoCommit(true);// reset
@@ -560,14 +582,68 @@ class MyDatabase {
         }
     }
 
-    private void loadPersonCache() throws SQLException {
-        String query = "SELECT person_id, name FROM People";
+    private void loadPeople() throws SQLException {
+        String query = "SELECT person_id, name, birthdate, deathdate FROM People";
         try (Statement stmt = connection.createStatement();
                 ResultSet rs = stmt.executeQuery(query)) {
             while (rs.next()) {
-                personCache.put(rs.getString("name").trim(), rs.getInt("person_id"));
+                Date death = rs.getDate("deathdate");
+                PersonRecord person = new PersonRecord(rs.getInt("person_id"),
+                        rs.getDate("birthdate").toLocalDate(),
+                        death == null ? null : death.toLocalDate());
+                peopleByName.computeIfAbsent(rs.getString("name").trim(), k -> new ArrayList<>()).add(person);
             }
         }
+    }
+
+    // Plausible = born on or before the release and not dead long before it
+    private static boolean plausibleFor(PersonRecord p, LocalDate release) {
+        return !p.birth.isAfter(release)
+                && (p.death == null || !p.death.isBefore(release.minusYears(POSTHUMOUS_YEARS)));
+    }
+
+    /*
+     * Movies.csv and Characters.csv credit people by name only. When a name belongs to several
+     * people, keep those who were alive around the release (born before it, not dead more than
+     * POSTHUMOUS_YEARS before it), then prefer the one who fits the most of that name's credits
+     * across the dataset (personCreditPrior), then the lowest person_id so the choice is stable.
+     * Near-duplicate records of the same person therefore all collapse onto one person_id.
+     */
+    private Integer resolvePerson(String name, LocalDate release) {
+        List<PersonRecord> candidates = peopleByName.get(name);
+        if (candidates == null) {
+            return null;
+        }
+        if (candidates.size() == 1 || release == null) {
+            return pickByPrior(candidates);
+        }
+        List<PersonRecord> pool = new ArrayList<>();
+        for (PersonRecord p : candidates) {
+            if (plausibleFor(p, release)) {
+                pool.add(p);
+            }
+        }
+        if (pool.isEmpty()) { // fall back to anyone born before the release, then to everyone
+            for (PersonRecord p : candidates) {
+                if (!p.birth.isAfter(release)) {
+                    pool.add(p);
+                }
+            }
+        }
+        return pickByPrior(pool.isEmpty() ? candidates : pool);
+    }
+
+    private Integer pickByPrior(List<PersonRecord> pool) {
+        PersonRecord best = null;
+        int bestPrior = -1;
+        for (PersonRecord p : pool) {
+            int prior = personCreditPrior.getOrDefault(p.id, 0);
+            if (prior > bestPrior || (prior == bestPrior && p.id < best.id)) {
+                best = p;
+                bestPrior = prior;
+            }
+        }
+        return best.id;
     }
 
     private void readInMovieData() throws Exception {
@@ -589,18 +665,37 @@ class MyDatabase {
             PreparedStatement workedInStmt = connection.prepareStatement(
                     "INSERT INTO workedIn (imdb_id, person_id, role) VALUES (?, ?, ?)");
 
-            int countLine = 0;
             int batchCount = 0;
 
+            List<String[]> movieRows = new ArrayList<>();
             while ((line = br.readLine()) != null) {
-                countLine++;
                 String[] columns = line.split(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
 
                 // Trim and remove quotes
                 for (int i = 0; i < columns.length; i++) {
                     columns[i] = columns[i].replaceAll("^\"|\"$", "").trim();
                 }
+                movieRows.add(columns);
+            }
 
+            // First pass: for shared names, count how many credits each person could plausibly hold
+            for (String[] columns : movieRows) {
+                LocalDate release = LocalDate.parse(columns[11]);
+                for (int i = 7; i <= 10; i++) {
+                    for (String name : columns[i].split(",")) {
+                        List<PersonRecord> candidates = peopleByName.get(name.trim());
+                        if (candidates == null || candidates.size() < 2)
+                            continue;
+                        for (PersonRecord p : candidates) {
+                            if (plausibleFor(p, release)) {
+                                personCreditPrior.merge(p.id, 1, Integer::sum);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (String[] columns : movieRows) {
                 // Insert into Movie
                 movieStmt.setInt(1, Integer.parseInt(columns[3])); // imdb_id
                 movieStmt.setString(2, columns[0]); // title
@@ -617,6 +712,8 @@ class MyDatabase {
                     cast.add(name.trim());
                 }
                 castByImdbId.put(movieId, cast);
+                LocalDate release = LocalDate.parse(columns[11]);
+                airDateByImdbId.put(movieId, release);
 
                 // Insert into MovieLanguages
                 for (String lang : columns[4].split(",")) {
@@ -649,8 +746,8 @@ class MyDatabase {
                         default -> null;
                     };
                     for (String name : columns[i].split(",")) {
-                        int personId = personCache.getOrDefault(name.trim(), -1);
-                        if (personId != -1) {
+                        Integer personId = resolvePerson(name.trim(), release);
+                        if (personId != null) {
                             workedInStmt.setInt(1, Integer.parseInt(columns[3]));
                             workedInStmt.setInt(2, personId);
                             workedInStmt.setString(3, role);
@@ -676,7 +773,6 @@ class MyDatabase {
             genreStmt.executeBatch();
             workedInStmt.executeBatch();
 
-            // System.out.println(countLine + " Movie lines were read and inserted.");
             movieStmt.close();
             langStmt.close();
             countryStmt.close();
@@ -691,11 +787,8 @@ class MyDatabase {
     private void readCharacterData() throws Exception {
         String csvFilePath = "Characters.csv";
         Map<String, Integer> characterIdMap = new HashMap<>();
-        Map<String, Integer> personIdMap = new HashMap<>();
         AtomicInteger idCounter = new AtomicInteger(1);
         int batchSize = 3000;
-
-        preloadPersonIDs(personIdMap);
 
         try (BufferedReader br = new BufferedReader(
                 new InputStreamReader(new FileInputStream(csvFilePath), StandardCharsets.UTF_8))) {
@@ -760,16 +853,12 @@ class MyDatabase {
                     String personName = columns[0].trim().replaceAll("^\"|\"$", "");
 
                     Integer characterId = characterIdMap.get(characterName);
-                    // Integer personId = personIdMap.getOrDefault(personName, -1);
-                    Integer personId = personIdMap.get(personName);
-                    // Integer imdbId = imdbIdMap.getOrDefault(movieTitle, -1);
                     Integer imdbId = imdbIdMap.get(movieTitle);
-                    // System.out.println(personId + "-" + columns[0] + " : " + columns[1] + "-" +
-                    // characterId);
-
-                    // if (personId == -1 || imdbId == -1)
-                    if (personId == null || imdbId == null)
-                        continue; // Log skipped rows for debugging
+                    if (imdbId == null)
+                        continue;
+                    Integer personId = resolvePerson(personName, airDateByImdbId.get(imdbId));
+                    if (personId == null)
+                        continue;
 
                     // Characters.csv repeats some movies' blocks; insert each relationship once
                     if (!seenPlayedBy.add(characterId + ":" + personId + ":" + imdbId))
@@ -907,18 +996,6 @@ class MyDatabase {
 
         } catch (Exception e) {
             throw new Exception("production_companies.csv: " + e.getMessage(), e);
-        }
-    }
-
-    // Preload IDs for optimization
-    private void preloadPersonIDs(Map<String, Integer> personIdMap) throws SQLException {
-        try (PreparedStatement pstmt = connection.prepareStatement("SELECT person_id, name FROM People")) {
-            ResultSet rs = pstmt.executeQuery();
-            while (rs.next()) {
-                String name = rs.getString("name");
-                int id = rs.getInt("person_id");
-                personIdMap.put(name, id);
-            }
         }
     }
 
